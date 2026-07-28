@@ -5,81 +5,100 @@
 #include <cstdint>
 #include <ranges>
 
-#define G 9.81
-
 namespace mavlink_nav_bridge {
-    // RC channel mapping (1-based user input → 0-based index):
-    //   RC1 (idx 0) = Roll       1000=left   1500=neutral  2000=right
-    //   RC2 (idx 1) = Pitch      1000=fwd    1500=neutral  2000=back  (ArduPilot: below neutral = nose down = forward)
-    //   RC3 (idx 2) = Throttle   1000=cut    1500=hover    2000=full climb
-    //   RC4 (idx 3) = Yaw        1000=left   1500=neutral  2000=right
+    namespace rc {
+        constexpr uint16_t MIN          = 1000;  // minimum PWM — throttle cut
+        constexpr uint16_t NEUTRAL      = 1500;  // neutral / hover point
+        constexpr uint16_t MAX          = 2000;  // maximum PWM
+        constexpr uint16_t LAND_DESCENT = 1400;  // slightly below hover for controlled landing
+    }
+
+    namespace ch {
+        constexpr size_t ROLL     = 0;
+        constexpr size_t PITCH    = 1;  // below NEUTRAL = forward (ArduPilot Mode 2)
+        constexpr size_t THROTTLE = 2;  // NEUTRAL = hover when airborne
+        constexpr size_t YAW      = 3;
+        constexpr size_t COUNT    = 4;
+    }
+
+    namespace physics {
+        constexpr double GRAVITY         = 9.81;  // m/s²
+        constexpr double MAX_PITCH_ACCEL = 4.0;   // m/s²
+        constexpr double MAX_YAW_RATE    = 1.5;   // rad/s
+        constexpr double DRAG_H          = 0.96;  // horizontal damping per tick (50 Hz)
+        constexpr double DRAG_V          = 0.99;  // vertical damping per tick
+    }
 
     struct DroneState {
-        double vx, vy, vz;
-        double x, y, z;
-        double yaw;  // radians
-        uint16_t rc[4];
-        bool armed;
+        bool     armed;
+        double   x, y, z;
+        double   vx, vy, vz;
+        double   yaw;           // radians
+        uint16_t rc[ch::COUNT];
 
-        DroneState() : armed(false), x(0), y(0), z(0), vx(0), vy(0), vz(0), yaw(0) {
-            std::ranges::fill(rc, uint16_t{1500});
-            rc[2] = 1000;  // throttle starts at cut
+        DroneState()
+            : armed(false), x(0), y(0), z(0), vx(0), vy(0), vz(0), yaw(0)
+        {
+            std::ranges::fill(rc, rc::NEUTRAL);
+            rc[ch::THROTTLE] = rc::MIN;
         }
     };
 
-    // Map RC value (1000-2000) to [-1.0, 1.0] relative to neutral (1500).
+    // Map RC value to [-1.0, 1.0] relative to NEUTRAL.
     inline double rc_normalize(uint16_t val) {
-        return (static_cast<double>(val) - 1500.0) / 500.0;
+        return (static_cast<double>(val) - rc::NEUTRAL) /
+            static_cast<double>(rc::MAX - rc::NEUTRAL);
     }
 
-    constexpr double MAX_THRUST_NET     = 12.0;     // m/s² net above hover
-    constexpr double MAX_PITCH_ACCEL    = 4.0;      // m/s² horizontal
-    constexpr double MAX_YAW_RATE       = 1.5;      // rad/s
-    constexpr double DRAG_H             = 0.94;     // per tick horizontal damping
-    constexpr double DRAG_V             = 0.90;     // per tick vertical damping
+    // Thrust from throttle: MIN→0, NEUTRAL→gravity (hover), MAX→2*gravity.
+    inline double throttle_to_thrust(uint16_t val) {
+        double t = (static_cast<double>(val) - rc::MIN) /
+            static_cast<double>(rc::MAX - rc::MIN);
+        return t * 2.0 * physics::GRAVITY;
+    }
 
-    inline void update_physics(DroneState& s, double dt) {
-        // Motor cut: not armed OR throttle at minimum
-        if (!s.armed || s.rc[2] <= 1000) [[unlikely]] {
+    inline void update_physics(DroneState & s, double dt) {
+        if (!s.armed || s.rc[ch::THROTTLE] <= rc::MIN) [[unlikely]] {
             if (s.z > 0.0) {
-                s.vz -= G * dt;
+                s.vz -= physics::GRAVITY * dt;
             } else {
                 s.vz = 0.0;
             }
-            s.vx *= DRAG_H;
-            s.vy *= DRAG_H;
-            s.x += s.vx * dt;
-            s.y += s.vy * dt;
-            s.z += s.vz * dt;
+            s.vx *= physics::DRAG_H;
+            s.vy *= physics::DRAG_H;
+            s.x  += s.vx * dt;
+            s.y  += s.vy * dt;
+            s.z  += s.vz * dt;
             if (s.z < 0.0) s.z = 0.0;
             return;
         }
 
-        // Throttle: 1500 = hover (net accel = 0), >1500 = climb, <1500 = sink
-        double throttle_net = rc_normalize(s.rc[2]) * MAX_THRUST_NET;
+        // Gravity always pulls down. Thrust counteracts it.
+        // At rc::NEUTRAL: thrust == gravity → hover.
+        // Below NEUTRAL: thrust < gravity → descend.
+        // Above NEUTRAL: thrust > gravity → climb.
+        s.vz -= physics::GRAVITY * dt;
+        s.vz += throttle_to_thrust(s.rc[ch::THROTTLE]) * dt;
 
-        // Yaw (RC4, idx 3)
-        s.yaw += rc_normalize(s.rc[3]) * MAX_YAW_RATE * dt;
+        // Yaw
+        s.yaw += rc_normalize(s.rc[ch::YAW]) * physics::MAX_YAW_RATE * dt;
 
-        // Pitch (RC2, idx 1): below 1500 = forward in ArduPilot → negate normalize
-        double pitch = -rc_normalize(s.rc[1]);
-
-        // Roll (RC1, idx 0): above 1500 = right
-        double roll = rc_normalize(s.rc[0]);
+        // Pitch: below NEUTRAL = nose down = forward → negate
+        double pitch = -rc_normalize(s.rc[ch::PITCH]);
+        double roll  =  rc_normalize(s.rc[ch::ROLL]);
 
         // Body → world frame
         double cos_y = std::cos(s.yaw);
         double sin_y = std::sin(s.yaw);
-        double ax = (pitch * cos_y - roll * sin_y) * MAX_PITCH_ACCEL;
-        double ay = (pitch * sin_y + roll * cos_y) * MAX_PITCH_ACCEL;
+        double ax = (pitch * cos_y - roll * sin_y) * physics::MAX_PITCH_ACCEL;
+        double ay = (pitch * sin_y + roll * cos_y) * physics::MAX_PITCH_ACCEL;
 
         s.vx += ax * dt;
         s.vy += ay * dt;
-        s.vz += throttle_net * dt;
 
-        s.vx *= DRAG_H;
-        s.vy *= DRAG_H;
-        s.vz *= DRAG_V;
+        s.vx *= physics::DRAG_H;
+        s.vy *= physics::DRAG_H;
+        s.vz *= physics::DRAG_V;
 
         s.x += s.vx * dt;
         s.y += s.vy * dt;
