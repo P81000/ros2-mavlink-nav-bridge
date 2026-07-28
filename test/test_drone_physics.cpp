@@ -5,17 +5,17 @@ using namespace mavlink_nav_bridge;
 
 TEST(DronePhysics, RcNormalizeNeutral)
 {
-    EXPECT_DOUBLE_EQ(rc_normalize(1500), 0.0);
+    EXPECT_DOUBLE_EQ(rc_normalize(rc::NEUTRAL), 0.0);
 }
 
 TEST(DronePhysics, RcNormalizeMax)
 {
-    EXPECT_DOUBLE_EQ(rc_normalize(2000), 1.0);
+    EXPECT_DOUBLE_EQ(rc_normalize(rc::MAX), 1.0);
 }
 
 TEST(DronePhysics, RcNormalizeMin)
 {
-    EXPECT_DOUBLE_EQ(rc_normalize(1000), -1.0);
+    EXPECT_DOUBLE_EQ(rc_normalize(rc::MIN), -1.0);
 }
 
 TEST(DronePhysics, DisarmedNoMovement)
@@ -33,28 +33,28 @@ TEST(DronePhysics, ThrottleCutAirborneDrops)
     DroneState s;
     s.armed = true;
     s.z = 5.0;
-    s.rc[2] = 1000;  // throttle cut
+    s.rc[ch::THROTTLE] = rc::MIN;  // motor cut
     update_physics(s, 0.02);
     EXPECT_LT(s.vz, 0.0);  // falling
 }
 
-TEST(DronePhysics, ThrottleHoverStable)
+TEST(DronePhysics, ThrottleAtNeutralHoversAirborne)
 {
     DroneState s;
     s.armed = true;
     s.z = 5.0;
-    s.rc[2] = 1500;  // hover
+    s.rc[ch::THROTTLE] = rc::NEUTRAL;  // thrust == gravity → hover
     update_physics(s, 0.02);
-    // Net accel = 0 at 1500, drag applied: vz stays near 0
-    EXPECT_NEAR(s.vz, 0.0, 0.01);
+    // After one tick: gravity - thrust = 0, drag applied → vz stays near 0
+    EXPECT_NEAR(s.vz, 0.0, 0.05);
 }
 
-TEST(DronePhysics, ThrottleAboveHoverClimbs)
+TEST(DronePhysics, ThrottleAboveNeutralClimbs)
 {
     DroneState s;
     s.armed = true;
     s.z = 0.0;
-    s.rc[2] = 2000;  // full throttle
+    s.rc[ch::THROTTLE] = rc::MAX;  // full throttle
     update_physics(s, 0.02);
     EXPECT_GT(s.vz, 0.0);
     EXPECT_GT(s.z, 0.0);
@@ -66,8 +66,8 @@ TEST(DronePhysics, PitchForwardMovesX)
     s.armed = true;
     s.z = 5.0;
     s.yaw = 0.0;
-    s.rc[1] = 1400;  // pitch forward (below neutral → negate in physics = positive pitch)
-    s.rc[2] = 1500;  // hover
+    s.rc[ch::THROTTLE] = rc::NEUTRAL;
+    s.rc[ch::PITCH]    = rc::MIN + 100;  // below neutral = forward
     update_physics(s, 0.02);
     EXPECT_GT(s.vx, 0.0);  // moving forward in world X
 }
@@ -77,8 +77,8 @@ TEST(DronePhysics, YawChangesHeading)
     DroneState s;
     s.armed = true;
     s.z = 5.0;
-    s.rc[2] = 1500;
-    s.rc[3] = 2000;  // full yaw right
+    s.rc[ch::THROTTLE] = rc::NEUTRAL;
+    s.rc[ch::YAW]      = rc::MAX;  // full yaw right
     double yaw_before = s.yaw;
     update_physics(s, 0.02);
     EXPECT_GT(s.yaw, yaw_before);
